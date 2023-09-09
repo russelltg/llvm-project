@@ -30,6 +30,7 @@
 #include "lldb/lldb-enumerations.h"
 
 #include "llvm/ADT/Twine.h"
+#include "llvm/Debuginfod/Debuginfod.h"
 
 #include <memory>
 #include <optional>
@@ -409,6 +410,7 @@ SourceManager::File::File(const FileSpec &file_spec, Target *target)
 
 void SourceManager::File::CommonInitializer(const FileSpec &file_spec,
                                             Target *target) {
+  std::optional<SymbolContextList> sc_list;
   if (m_mod_time == llvm::sys::TimePoint<>()) {
     if (target) {
       m_source_map_mod_id = target->GetSourcePathMap().GetModificationID();
@@ -417,18 +419,19 @@ void SourceManager::File::CommonInitializer(const FileSpec &file_spec,
         // If this is just a file name, lets see if we can find it in the
         // target:
         bool check_inlines = false;
-        SymbolContextList sc_list;
+        sc_list = SymbolContextList();
         size_t num_matches =
             target->GetImages().ResolveSymbolContextForFilePath(
                 file_spec.GetFilename().AsCString(), 0, check_inlines,
                 SymbolContextItem(eSymbolContextModule |
                                   eSymbolContextCompUnit),
-                sc_list);
+                *sc_list);
         bool got_multiple = false;
         if (num_matches != 0) {
           if (num_matches > 1) {
             CompileUnit *test_cu = nullptr;
-            for (const SymbolContext &sc : sc_list) {
+            for (const SymbolContext &sc : *sc_list) {
+
               if (sc.comp_unit) {
                 if (test_cu) {
                   if (test_cu != sc.comp_unit)
@@ -463,6 +466,29 @@ void SourceManager::File::CommonInitializer(const FileSpec &file_spec,
         if (remapped) {
           m_file_spec = *remapped;
           m_mod_time = FileSystem::Instance().GetModificationTime(m_file_spec);
+        }
+
+        if (!sc_list.has_value()) {
+          sc_list = SymbolContextList();
+          size_t num_matches =
+              target->GetImages().ResolveSymbolContextForFilePath(
+                  file_spec.GetFilename().AsCString(), 0, false,
+                  SymbolContextItem(eSymbolContextModule |
+                                    eSymbolContextCompUnit),
+                *sc_list);
+
+        }
+        if (m_mod_time == llvm::sys::TimePoint<>()) {
+          for (const auto& sc : *sc_list) {
+            auto result = llvm::getCachedOrDownloadSource(llvm::object::parseBuildID(sc.module_sp->GetUUID().GetAsString("")), file_spec.GetPath());
+            
+            if (!result) {
+              LLDB_LOG(GetLog(LLDBLog::Symbols), "failed to download source for '%s' from debuginfod", file_spec.GetPath().c_str());
+            } else {
+              m_file_spec = FileSpec(*result);
+              m_mod_time = FileSystem::Instance().GetModificationTime(m_file_spec);
+            }
+          }
         }
       }
     }
